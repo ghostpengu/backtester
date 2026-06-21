@@ -1,0 +1,577 @@
+#region Using declarations
+using System;
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
+using System.Windows.Media;
+using NinjaTrader.Cbi;
+using NinjaTrader.Data;
+using NinjaTrader.NinjaScript;
+#endregion
+
+namespace NinjaTrader.NinjaScript.Indicators
+{
+    public class MCOTR : Indicator
+    {
+        private readonly object syncLock = new object();
+
+        private readonly Dictionary<double, long> bidBook = new Dictionary<double, long>();
+        private readonly Dictionary<double, long> askBook = new Dictionary<double, long>();
+
+        private readonly Queue<RollingPoint> rollingPoints = new Queue<RollingPoint>();
+
+        private double lastValue = 0;
+        private double lastRollingMax = 0;
+        private double lastRollingMin = 0;
+
+        private double lastAlertRollingMax = double.NaN;
+        private double lastAlertRollingMin = double.NaN;
+
+        private bool rollingReady = false;
+        private bool alertRollingReady = false;
+
+        private DateTime lastRollingSampleTime = DateTime.MinValue;
+        private DateTime bothSidesReadySince = DateTime.MinValue;
+
+        private struct RollingPoint
+        {
+            public DateTime Time;
+            public double Value;
+
+            public RollingPoint(DateTime time, double value)
+            {
+                Time = time;
+                Value = value;
+            }
+        }
+
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Name                     = "MCOTR";
+                Description              = "Morning Cup Of Trades Reversions - Plots the liquidity imbalance from the order book in real time using level 2 data. A rolling top and bottom of the liquidity imbalance are plotted to indicate areas of extension for high potential price reversion.";
+                Calculate                = Calculate.OnBarClose;
+                IsOverlay                = false;
+                DrawOnPricePanel         = false;
+                DisplayInDataBox         = true;
+                PaintPriceMarkers        = false;
+                IsSuspendedWhileInactive = false;
+
+                LevelsToSum              = 0;
+                MaxStoredLevels          = 0;
+
+                NormalizeToPercent       = false;
+                UseExponentialWeights    = false;
+                HalfLifeLevels           = 5.0;
+                AveragePerLevel          = false;
+
+                MinLevelSize             = 0;
+                MaxLevelSize             = 0;
+                InvertOutput             = false;
+
+                ShowRollingExtremes      = true;
+                RollingWindowMinutes     = 30.0;
+
+                RequireBothSidesForRolling       = true;
+                MinBookLevelsPerSideForRolling   = 1;
+                WarmupMillisecondsAfterBothSides = 1000;
+
+                RollingSampleMilliseconds = 2000;
+                MaxRollingSamples         = 25000;
+
+                AddPlot(Brushes.Transparent, "LiquidityImbalance");
+                AddPlot(Brushes.Transparent, "RollingMax");
+                AddPlot(Brushes.Transparent, "RollingMin");
+
+                AddPlot(Brushes.Transparent, "AlertRollingMax");
+                AddPlot(Brushes.Transparent, "AlertRollingMin");
+                AddPlot(Brushes.Transparent, "RollingReady");
+
+                AddLine(Brushes.Transparent, 0, "Zero");
+            }
+        }
+
+        protected override void OnBarUpdate()
+        {
+            double value;
+            double rollingMax;
+            double rollingMin;
+            double alertRollingMax;
+            double alertRollingMin;
+            bool isReady;
+            bool isAlertReady;
+
+            lock (syncLock)
+            {
+                value = lastValue;
+                rollingMax = lastRollingMax;
+                rollingMin = lastRollingMin;
+                alertRollingMax = lastAlertRollingMax;
+                alertRollingMin = lastAlertRollingMin;
+                isReady = rollingReady;
+                isAlertReady = alertRollingReady;
+            }
+
+            Values[0][0] = value;
+
+            if (ShowRollingExtremes && isReady)
+            {
+                Values[1][0] = rollingMax;
+                Values[2][0] = rollingMin;
+            }
+            else
+            {
+                Values[1][0] = double.NaN;
+                Values[2][0] = double.NaN;
+            }
+
+            if (ShowRollingExtremes && isAlertReady)
+            {
+                Values[3][0] = alertRollingMax;
+                Values[4][0] = alertRollingMin;
+                Values[5][0] = 1.0;
+            }
+            else
+            {
+                Values[3][0] = double.NaN;
+                Values[4][0] = double.NaN;
+                Values[5][0] = 0.0;
+            }
+
+            // Removed zero-cross color logic.
+            // LiquidityImbalance now keeps the fixed plot color from AddPlot().
+        }
+
+        protected override void OnMarketDepth(MarketDepthEventArgs e)
+        {
+            if (e == null)
+                return;
+
+            if (e.MarketDataType != MarketDataType.Bid && e.MarketDataType != MarketDataType.Ask)
+                return;
+
+            lock (syncLock)
+            {
+                if (e.IsReset)
+                {
+                    bidBook.Clear();
+                    askBook.Clear();
+                    rollingPoints.Clear();
+
+                    lastValue = 0;
+                    lastRollingMax = 0;
+                    lastRollingMin = 0;
+                    lastAlertRollingMax = double.NaN;
+                    lastAlertRollingMin = double.NaN;
+
+                    rollingReady = false;
+                    alertRollingReady = false;
+                    lastRollingSampleTime = DateTime.MinValue;
+                    bothSidesReadySince = DateTime.MinValue;
+
+                    return;
+                }
+
+                Dictionary<double, long> book =
+                    e.MarketDataType == MarketDataType.Bid ? bidBook : askBook;
+
+                ApplyDepthUpdate(book, e);
+
+                TrimBook(bidBook, true);
+                TrimBook(askBook, false);
+
+                double bidLiquidity;
+                double askLiquidity;
+
+                double computed = CalculateImbalance(out bidLiquidity, out askLiquidity);
+                lastValue = computed;
+
+                DateTime now = GetDepthTime(e);
+
+                bool validBook = IsValidBookForRolling(bidLiquidity, askLiquidity);
+
+                if (validBook)
+                {
+                    if (bothSidesReadySince == DateTime.MinValue)
+                        bothSidesReadySince = now;
+                }
+                else
+                {
+                    bothSidesReadySince = DateTime.MinValue;
+                }
+
+                bool validRollingSample = validBook;
+
+                if (WarmupMillisecondsAfterBothSides > 0)
+                {
+                    validRollingSample =
+                        validRollingSample
+                        && bothSidesReadySince != DateTime.MinValue
+                        && (now - bothSidesReadySince).TotalMilliseconds >= WarmupMillisecondsAfterBothSides;
+                }
+
+                UpdateRollingWindow(now, computed, validRollingSample);
+            }
+        }
+
+        private void ApplyDepthUpdate(Dictionary<double, long> book, MarketDepthEventArgs e)
+        {
+            double price = PriceKey(e.Price);
+
+            if (e.Operation == Operation.Remove || e.Volume <= 0)
+            {
+                book.Remove(price);
+                return;
+            }
+
+            book[price] = e.Volume;
+        }
+
+        private bool IsValidBookForRolling(double bidLiquidity, double askLiquidity)
+        {
+            if (!ShowRollingExtremes)
+                return false;
+
+            if (!RequireBothSidesForRolling)
+                return true;
+
+            if (bidLiquidity <= 0 || askLiquidity <= 0)
+                return false;
+
+            if (bidBook.Count < MinBookLevelsPerSideForRolling)
+                return false;
+
+            if (askBook.Count < MinBookLevelsPerSideForRolling)
+                return false;
+
+            return true;
+        }
+
+        private void UpdateRollingWindow(DateTime now, double value, bool addCurrentSample)
+        {
+            if (!ShowRollingExtremes)
+            {
+                rollingPoints.Clear();
+
+                rollingReady = false;
+                alertRollingReady = false;
+
+                lastRollingMax = value;
+                lastRollingMin = value;
+                lastAlertRollingMax = double.NaN;
+                lastAlertRollingMin = double.NaN;
+
+                return;
+            }
+
+            double windowMinutes = Math.Max(0.01, RollingWindowMinutes);
+            TimeSpan window = TimeSpan.FromMinutes(windowMinutes);
+
+            while (rollingPoints.Count > 0 && now - rollingPoints.Peek().Time > window)
+                rollingPoints.Dequeue();
+
+            if (addCurrentSample && rollingPoints.Count > 0)
+            {
+                double alertMax = double.MinValue;
+                double alertMin = double.MaxValue;
+
+                foreach (RollingPoint point in rollingPoints)
+                {
+                    if (point.Value > alertMax)
+                        alertMax = point.Value;
+
+                    if (point.Value < alertMin)
+                        alertMin = point.Value;
+                }
+
+                alertRollingReady = true;
+                lastAlertRollingMax = alertMax;
+                lastAlertRollingMin = alertMin;
+            }
+            else
+            {
+                alertRollingReady = false;
+                lastAlertRollingMax = double.NaN;
+                lastAlertRollingMin = double.NaN;
+            }
+
+            if (addCurrentSample)
+            {
+                bool enoughTimePassed =
+                    lastRollingSampleTime == DateTime.MinValue
+                    || (now - lastRollingSampleTime).TotalMilliseconds >= Math.Max(1, RollingSampleMilliseconds);
+
+                if (enoughTimePassed)
+                {
+                    rollingPoints.Enqueue(new RollingPoint(now, value));
+                    lastRollingSampleTime = now;
+                }
+            }
+
+            while (rollingPoints.Count > Math.Max(10, MaxRollingSamples))
+                rollingPoints.Dequeue();
+
+            if (rollingPoints.Count == 0)
+            {
+                rollingReady = false;
+                lastRollingMax = value;
+                lastRollingMin = value;
+                return;
+            }
+
+            double max = double.MinValue;
+            double min = double.MaxValue;
+
+            foreach (RollingPoint point in rollingPoints)
+            {
+                if (point.Value > max)
+                    max = point.Value;
+
+                if (point.Value < min)
+                    min = point.Value;
+            }
+
+            rollingReady = true;
+            lastRollingMax = max;
+            lastRollingMin = min;
+        }
+
+        private DateTime GetDepthTime(MarketDepthEventArgs e)
+        {
+            if (e.Time == DateTime.MinValue)
+                return DateTime.Now;
+
+            return e.Time;
+        }
+
+        private double CalculateImbalance(out double bidLiquidity, out double askLiquidity)
+        {
+            bidLiquidity = ComputeLiquidity(bidBook, true);
+            askLiquidity = ComputeLiquidity(askBook, false);
+
+            double value;
+
+            if (NormalizeToPercent)
+            {
+                double denominator = bidLiquidity + askLiquidity;
+                value = denominator <= 0 ? 0 : 100.0 * (bidLiquidity - askLiquidity) / denominator;
+            }
+            else
+            {
+                value = bidLiquidity - askLiquidity;
+            }
+
+            return InvertOutput ? -value : value;
+        }
+
+        private double ComputeLiquidity(Dictionary<double, long> book, bool bidSide)
+        {
+            if (book.Count == 0)
+                return 0;
+
+            List<KeyValuePair<double, long>> levels =
+                new List<KeyValuePair<double, long>>(book);
+
+            if (bidSide)
+                levels.Sort((a, b) => b.Key.CompareTo(a.Key));
+            else
+                levels.Sort((a, b) => a.Key.CompareTo(b.Key));
+
+            int maxLevels = LevelsToSum <= 0
+                ? levels.Count
+                : Math.Min(LevelsToSum, levels.Count);
+
+            double total = 0;
+            double weightTotal = 0;
+
+            for (int i = 0; i < maxLevels; i++)
+            {
+                long volume = levels[i].Value;
+
+                if (volume <= 0)
+                    continue;
+
+                if (MinLevelSize > 0 && volume < MinLevelSize)
+                    continue;
+
+                if (MaxLevelSize > 0 && volume > MaxLevelSize)
+                    continue;
+
+                double weight = 1.0;
+
+                if (UseExponentialWeights)
+                {
+                    double halfLife = Math.Max(HalfLifeLevels, 0.000001);
+                    weight = Math.Pow(0.5, i / halfLife);
+                }
+
+                total += volume * weight;
+                weightTotal += weight;
+            }
+
+            if (AveragePerLevel && weightTotal > 0)
+                return total / weightTotal;
+
+            return total;
+        }
+
+        private void TrimBook(Dictionary<double, long> book, bool bidSide)
+        {
+            if (MaxStoredLevels <= 0 || book.Count <= MaxStoredLevels)
+                return;
+
+            List<double> prices = new List<double>(book.Keys);
+
+            prices.Sort();
+
+            if (bidSide)
+                prices.Reverse();
+
+            for (int i = MaxStoredLevels; i < prices.Count; i++)
+                book.Remove(prices[i]);
+        }
+
+        private double PriceKey(double price)
+        {
+            if (TickSize <= 0)
+                return price;
+
+            return Math.Round(price / TickSize, 0, MidpointRounding.AwayFromZero) * TickSize;
+        }
+
+        #region Parameters
+
+        [NinjaScriptProperty]
+        [Range(0, int.MaxValue)]
+        [Display(Name = "Levels to sum, 0 = all received", GroupName = "Bookmap Style", Order = 1)]
+        public int LevelsToSum { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, int.MaxValue)]
+        [Display(Name = "Max stored levels, 0 = no cap", GroupName = "Bookmap Style", Order = 2)]
+        public int MaxStoredLevels { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Normalize to percent", GroupName = "Bookmap Style", Order = 3)]
+        public bool NormalizeToPercent { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Use exponential weights", GroupName = "Bookmap Style", Order = 4)]
+        public bool UseExponentialWeights { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.000001, double.MaxValue)]
+        [Display(Name = "Half-life levels", GroupName = "Bookmap Style", Order = 5)]
+        public double HalfLifeLevels { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Average per level", GroupName = "Bookmap Style", Order = 6)]
+        public bool AveragePerLevel { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, int.MaxValue)]
+        [Display(Name = "Minimum level size, 0 = off", GroupName = "Filters", Order = 7)]
+        public int MinLevelSize { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, int.MaxValue)]
+        [Display(Name = "Maximum level size, 0 = off", GroupName = "Filters", Order = 8)]
+        public int MaxLevelSize { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Invert output", GroupName = "Display", Order = 9)]
+        public bool InvertOutput { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Show rolling max/min lines", GroupName = "Rolling Extremes", Order = 10)]
+        public bool ShowRollingExtremes { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.01, 1440)]
+        [Display(Name = "Rolling window minutes", GroupName = "Rolling Extremes", Order = 11)]
+        public double RollingWindowMinutes { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Require both sides for rolling", GroupName = "Rolling Extremes", Order = 12)]
+        public bool RequireBothSidesForRolling { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 100)]
+        [Display(Name = "Min book levels per side for rolling", GroupName = "Rolling Extremes", Order = 13)]
+        public int MinBookLevelsPerSideForRolling { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 60000)]
+        [Display(Name = "Warmup ms after both sides", GroupName = "Rolling Extremes", Order = 14)]
+        public int WarmupMillisecondsAfterBothSides { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 60000)]
+        [Display(Name = "Rolling sample milliseconds", GroupName = "Rolling Extremes", Order = 15)]
+        public int RollingSampleMilliseconds { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(10, 100000)]
+        [Display(Name = "Max rolling samples", GroupName = "Rolling Extremes", Order = 16)]
+        public int MaxRollingSamples { get; set; }
+
+        #endregion
+    }
+}
+
+#region NinjaScript generated code. Neither change nor remove.
+
+namespace NinjaTrader.NinjaScript.Indicators
+{
+	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
+	{
+		private MCOTR[] cacheMCOTR;
+		public MCOTR MCOTR(int levelsToSum, int maxStoredLevels, bool normalizeToPercent, bool useExponentialWeights, double halfLifeLevels, bool averagePerLevel, int minLevelSize, int maxLevelSize, bool invertOutput, bool showRollingExtremes, double rollingWindowMinutes, bool requireBothSidesForRolling, int minBookLevelsPerSideForRolling, int warmupMillisecondsAfterBothSides, int rollingSampleMilliseconds, int maxRollingSamples)
+		{
+			return MCOTR(Input, levelsToSum, maxStoredLevels, normalizeToPercent, useExponentialWeights, halfLifeLevels, averagePerLevel, minLevelSize, maxLevelSize, invertOutput, showRollingExtremes, rollingWindowMinutes, requireBothSidesForRolling, minBookLevelsPerSideForRolling, warmupMillisecondsAfterBothSides, rollingSampleMilliseconds, maxRollingSamples);
+		}
+
+		public MCOTR MCOTR(ISeries<double> input, int levelsToSum, int maxStoredLevels, bool normalizeToPercent, bool useExponentialWeights, double halfLifeLevels, bool averagePerLevel, int minLevelSize, int maxLevelSize, bool invertOutput, bool showRollingExtremes, double rollingWindowMinutes, bool requireBothSidesForRolling, int minBookLevelsPerSideForRolling, int warmupMillisecondsAfterBothSides, int rollingSampleMilliseconds, int maxRollingSamples)
+		{
+			if (cacheMCOTR != null)
+				for (int idx = 0; idx < cacheMCOTR.Length; idx++)
+					if (cacheMCOTR[idx] != null && cacheMCOTR[idx].LevelsToSum == levelsToSum && cacheMCOTR[idx].MaxStoredLevels == maxStoredLevels && cacheMCOTR[idx].NormalizeToPercent == normalizeToPercent && cacheMCOTR[idx].UseExponentialWeights == useExponentialWeights && cacheMCOTR[idx].HalfLifeLevels == halfLifeLevels && cacheMCOTR[idx].AveragePerLevel == averagePerLevel && cacheMCOTR[idx].MinLevelSize == minLevelSize && cacheMCOTR[idx].MaxLevelSize == maxLevelSize && cacheMCOTR[idx].InvertOutput == invertOutput && cacheMCOTR[idx].ShowRollingExtremes == showRollingExtremes && cacheMCOTR[idx].RollingWindowMinutes == rollingWindowMinutes && cacheMCOTR[idx].RequireBothSidesForRolling == requireBothSidesForRolling && cacheMCOTR[idx].MinBookLevelsPerSideForRolling == minBookLevelsPerSideForRolling && cacheMCOTR[idx].WarmupMillisecondsAfterBothSides == warmupMillisecondsAfterBothSides && cacheMCOTR[idx].RollingSampleMilliseconds == rollingSampleMilliseconds && cacheMCOTR[idx].MaxRollingSamples == maxRollingSamples && cacheMCOTR[idx].EqualsInput(input))
+						return cacheMCOTR[idx];
+			return CacheIndicator<MCOTR>(new MCOTR(){ LevelsToSum = levelsToSum, MaxStoredLevels = maxStoredLevels, NormalizeToPercent = normalizeToPercent, UseExponentialWeights = useExponentialWeights, HalfLifeLevels = halfLifeLevels, AveragePerLevel = averagePerLevel, MinLevelSize = minLevelSize, MaxLevelSize = maxLevelSize, InvertOutput = invertOutput, ShowRollingExtremes = showRollingExtremes, RollingWindowMinutes = rollingWindowMinutes, RequireBothSidesForRolling = requireBothSidesForRolling, MinBookLevelsPerSideForRolling = minBookLevelsPerSideForRolling, WarmupMillisecondsAfterBothSides = warmupMillisecondsAfterBothSides, RollingSampleMilliseconds = rollingSampleMilliseconds, MaxRollingSamples = maxRollingSamples }, input, ref cacheMCOTR);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
+{
+	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
+	{
+		public Indicators.MCOTR MCOTR(int levelsToSum, int maxStoredLevels, bool normalizeToPercent, bool useExponentialWeights, double halfLifeLevels, bool averagePerLevel, int minLevelSize, int maxLevelSize, bool invertOutput, bool showRollingExtremes, double rollingWindowMinutes, bool requireBothSidesForRolling, int minBookLevelsPerSideForRolling, int warmupMillisecondsAfterBothSides, int rollingSampleMilliseconds, int maxRollingSamples)
+		{
+			return indicator.MCOTR(Input, levelsToSum, maxStoredLevels, normalizeToPercent, useExponentialWeights, halfLifeLevels, averagePerLevel, minLevelSize, maxLevelSize, invertOutput, showRollingExtremes, rollingWindowMinutes, requireBothSidesForRolling, minBookLevelsPerSideForRolling, warmupMillisecondsAfterBothSides, rollingSampleMilliseconds, maxRollingSamples);
+		}
+
+		public Indicators.MCOTR MCOTR(ISeries<double> input , int levelsToSum, int maxStoredLevels, bool normalizeToPercent, bool useExponentialWeights, double halfLifeLevels, bool averagePerLevel, int minLevelSize, int maxLevelSize, bool invertOutput, bool showRollingExtremes, double rollingWindowMinutes, bool requireBothSidesForRolling, int minBookLevelsPerSideForRolling, int warmupMillisecondsAfterBothSides, int rollingSampleMilliseconds, int maxRollingSamples)
+		{
+			return indicator.MCOTR(input, levelsToSum, maxStoredLevels, normalizeToPercent, useExponentialWeights, halfLifeLevels, averagePerLevel, minLevelSize, maxLevelSize, invertOutput, showRollingExtremes, rollingWindowMinutes, requireBothSidesForRolling, minBookLevelsPerSideForRolling, warmupMillisecondsAfterBothSides, rollingSampleMilliseconds, maxRollingSamples);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
+	{
+		public Indicators.MCOTR MCOTR(int levelsToSum, int maxStoredLevels, bool normalizeToPercent, bool useExponentialWeights, double halfLifeLevels, bool averagePerLevel, int minLevelSize, int maxLevelSize, bool invertOutput, bool showRollingExtremes, double rollingWindowMinutes, bool requireBothSidesForRolling, int minBookLevelsPerSideForRolling, int warmupMillisecondsAfterBothSides, int rollingSampleMilliseconds, int maxRollingSamples)
+		{
+			return indicator.MCOTR(Input, levelsToSum, maxStoredLevels, normalizeToPercent, useExponentialWeights, halfLifeLevels, averagePerLevel, minLevelSize, maxLevelSize, invertOutput, showRollingExtremes, rollingWindowMinutes, requireBothSidesForRolling, minBookLevelsPerSideForRolling, warmupMillisecondsAfterBothSides, rollingSampleMilliseconds, maxRollingSamples);
+		}
+
+		public Indicators.MCOTR MCOTR(ISeries<double> input , int levelsToSum, int maxStoredLevels, bool normalizeToPercent, bool useExponentialWeights, double halfLifeLevels, bool averagePerLevel, int minLevelSize, int maxLevelSize, bool invertOutput, bool showRollingExtremes, double rollingWindowMinutes, bool requireBothSidesForRolling, int minBookLevelsPerSideForRolling, int warmupMillisecondsAfterBothSides, int rollingSampleMilliseconds, int maxRollingSamples)
+		{
+			return indicator.MCOTR(input, levelsToSum, maxStoredLevels, normalizeToPercent, useExponentialWeights, halfLifeLevels, averagePerLevel, minLevelSize, maxLevelSize, invertOutput, showRollingExtremes, rollingWindowMinutes, requireBothSidesForRolling, minBookLevelsPerSideForRolling, warmupMillisecondsAfterBothSides, rollingSampleMilliseconds, maxRollingSamples);
+		}
+	}
+}
+
+#endregion

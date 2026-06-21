@@ -1,0 +1,4 @@
+databento
+numpy
+pandas
+plotly
