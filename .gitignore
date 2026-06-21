@@ -11,9 +11,9 @@ env/
 output/
 agent-tools/
 
-data/*.dbn.zst
-data/*.dbn
-data/*.zst
+data/**/*.dbn.zst
+data/**/*.dbn
+data/**/*.zst
 
 .DS_Store
 Thumbs.db

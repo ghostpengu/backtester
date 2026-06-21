@@ -15,12 +15,29 @@ from portfolio import Portfolio, format_performance_debug
 from strategies import VPINSpreadStrategy
 
 
-DEFAULT_DATA_PATH = Path("data") / "xnas-itch-20180501-20260612.ohlcv-1m.dbn.zst"
 DEFAULT_TIMEZONE = "America/New_York"
 DEFAULT_DATE = "latest"
 DEFAULT_RESAMPLE = "none"
 DEFAULT_SPREAD_CONFIG = VPINSpreadConfig()
 DEFAULT_INSTRUMENT = "SPY"
+
+
+def default_data_path(instrument: str = DEFAULT_INSTRUMENT) -> Path:
+    instrument_dir = Path("data") / instrument.upper()
+    canonical = instrument_dir / "ohlcv-1m.dbn.zst"
+    if canonical.exists():
+        return canonical
+
+    matches = sorted(instrument_dir.glob("*.dbn.zst"))
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        return matches[-1]
+
+    return canonical
+
+
+DEFAULT_DATA_PATH = default_data_path(DEFAULT_INSTRUMENT)
 DEFAULT_OUTPUT_PATH = Path("output") / f"{DEFAULT_INSTRUMENT.lower()}_price.html"
 DEFAULT_INITIAL_CASH = 100_000.0
 DEFAULT_ENTRY_STEP_EXPOSURE = 0.5
@@ -530,8 +547,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data",
         type=Path,
-        default=DEFAULT_DATA_PATH,
-        help=f"Path to the Databento DBN file. Default: {DEFAULT_DATA_PATH}",
+        default=None,
+        help=f"Path to the Databento DBN file. Default: data/<instrument>/ohlcv-1m.dbn.zst",
     )
     parser.add_argument(
         "--output",
@@ -596,10 +613,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    data_path = args.data or default_data_path(args.instrument)
     output_path = args.output or default_output_path(args.instrument, "price")
 
     try:
-        df = load_data(args.data, instrument=args.instrument)
+        df = load_data(data_path, instrument=args.instrument)
         chart_data = prepare_chart_data(
             df,
             date=args.date,
@@ -621,7 +639,7 @@ def main() -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    print(f"Loaded {len(df):,} {args.instrument} rows from {args.data}")
+    print(f"Loaded {len(df):,} {args.instrument} rows from {data_path}")
     print(
         "Plotted "
         f"{len(chart_data):,} points from {chart_data.index.min()} "

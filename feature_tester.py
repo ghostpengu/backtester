@@ -15,8 +15,8 @@ from plotly.subplots import make_subplots
 
 from indicators import compute_vpin_lsf, compute_vpin_spread
 from backtester import (
-    DEFAULT_DATA_PATH,
     DEFAULT_INSTRUMENT,
+    default_data_path,
     DEFAULT_RESAMPLE,
     default_output_path,
     filter_chart_data,
@@ -1614,8 +1614,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data",
         type=Path,
-        default=DEFAULT_DATA_PATH,
-        help=f"Path to the Databento DBN file. Default: {DEFAULT_DATA_PATH}",
+        default=None,
+        help="Path to the Databento DBN file. Default: data/<instrument>/ohlcv-1m.dbn.zst",
     )
     parser.add_argument(
         "--output",
@@ -1702,13 +1702,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    data_path = args.data or default_data_path(args.instrument)
     output_path = args.output or default_output_path(args.instrument, "feature_report")
     progress = ProgressReporter(enabled=not args.no_progress)
     try:
         horizon_minutes = parse_horizons(args.horizons)
         vpin_timeframes = parse_vpin_timeframes(args.vpin_timeframes)
-        progress.step(f"Loading {args.instrument} data from {args.data}")
-        df = load_data(args.data, instrument=args.instrument)
+        progress.step(f"Loading {args.instrument} data from {data_path}")
+        df = load_data(data_path, instrument=args.instrument)
         progress.step("Preparing bars")
         bars = resample_bars(prepare_bars(df), args.resample)
         bars = filter_session(bars, args.session)
@@ -1748,7 +1749,7 @@ def main() -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    print(f"Loaded {len(df):,} {args.instrument} rows from {args.data}")
+    print(f"Loaded {len(df):,} {args.instrument} rows from {data_path}")
     print(
         "Analyzed "
         f"{len(analysis_frame):,} {args.session} rows from {analysis_frame.index.min()} "
