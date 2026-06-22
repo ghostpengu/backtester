@@ -32,7 +32,7 @@ DEFAULT_CSV_DIR = Path("output") / "features"
 DEFAULT_DATE = "all"
 DEFAULT_SESSION = "regular"
 DEFAULT_HORIZONS = ("5m", "15m", "30m", "1h", "1d", "7d", "14d", "28d", "60d", "365d")
-DEFAULT_VPIN_TIMEFRAMES = ("1m", "5m", "15m", "30m", "1h", "4h", "1d")
+DEFAULT_TIMEFRAMES = ("1m", "5m", "15m", "30m", "1h", "4h", "1d")
 DEFAULT_FEATURE_WINDOWS = (5, 15, 30, 60, 390)
 DEFAULT_FEATURE_SET = "vpin"
 DEFAULT_QUANTILES = 5
@@ -176,7 +176,7 @@ def parse_horizon(value: str) -> HorizonSpec:
     return HorizonSpec(minutes=minutes, bars=minutes, label=label)
 
 
-def parse_vpin_timeframes(value: str) -> list[TimeframeSpec]:
+def parse_timeframes(value: str) -> list[TimeframeSpec]:
     timeframes: list[TimeframeSpec] = []
     seen_labels: set[str] = set()
     for raw_part in value.split(","):
@@ -192,7 +192,7 @@ def parse_vpin_timeframes(value: str) -> list[TimeframeSpec]:
         timeframes.append(spec)
 
     if not timeframes:
-        raise ValueError("at least one VPIN timeframe is required.")
+        raise ValueError("at least one timeframe is required.")
     return timeframes
 
 
@@ -228,10 +228,10 @@ def parse_timeframe(value: str) -> TimeframeSpec:
     elif label == "1d":
         minutes = 390
     else:
-        raise ValueError(f"Unsupported VPIN timeframe: {value}")
+        raise ValueError(f"Unsupported timeframe: {value}")
 
     if minutes < 1:
-        raise ValueError("VPIN timeframes must be positive.")
+        raise ValueError("timeframes must be positive.")
     return TimeframeSpec(label=label, minutes=minutes)
 
 
@@ -277,12 +277,12 @@ def build_feature_frame(
     horizons: list[HorizonSpec | int],
     *,
     feature_windows: tuple[int, ...] = DEFAULT_FEATURE_WINDOWS,
-    vpin_timeframes: list[TimeframeSpec] | None = None,
+    timeframes: list[TimeframeSpec] | None = None,
     progress: ProgressReporter | None = None,
 ) -> pd.DataFrame:
     _validate_ohlcv_bars(bars)
     horizon_specs = build_horizon_specs(bars, horizons)
-    vpin_timeframes = vpin_timeframes or parse_vpin_timeframes(",".join(DEFAULT_VPIN_TIMEFRAMES))
+    timeframes = timeframes or parse_timeframes(",".join(DEFAULT_TIMEFRAMES))
 
     if progress is not None:
         progress.step("Computing OHLCV technical features")
@@ -291,7 +291,7 @@ def build_feature_frame(
 
     if progress is not None:
         progress.step("Computing VPIN indicator features")
-    indicators = compute_indicator_features(bars, vpin_timeframes=vpin_timeframes, progress=progress)
+    indicators = compute_indicator_features(bars, timeframes=timeframes, progress=progress)
 
     if progress is not None:
         progress.step("Computing forward targets")
@@ -372,15 +372,15 @@ def compute_technical_features(
 def compute_indicator_features(
     bars: pd.DataFrame,
     *,
-    vpin_timeframes: list[TimeframeSpec] | None = None,
+    timeframes: list[TimeframeSpec] | None = None,
     progress: ProgressReporter | None = None,
 ) -> pd.DataFrame:
     _validate_ohlcv_bars(bars)
-    timeframes = vpin_timeframes or parse_vpin_timeframes(",".join(DEFAULT_VPIN_TIMEFRAMES))
+    timeframes = timeframes or parse_timeframes(",".join(DEFAULT_TIMEFRAMES))
     frames: list[pd.DataFrame] = []
     for position, timeframe in enumerate(timeframes, start=1):
         if progress is not None:
-            progress.step(f"  VPIN timeframe {timeframe.label} ({position}/{len(timeframes)})")
+            progress.step(f"  timeframe {timeframe.label} ({position}/{len(timeframes)})")
 
         timeframe_bars = resample_timeframe_bars(bars, timeframe)
         if timeframe_bars.empty:
@@ -1568,10 +1568,10 @@ def run_feature_analysis(
     end: str | None = None,
     quantiles: int = DEFAULT_QUANTILES,
     feature_set: str = DEFAULT_FEATURE_SET,
-    vpin_timeframes: list[TimeframeSpec] | None = None,
+    timeframes: list[TimeframeSpec] | None = None,
     progress: ProgressReporter | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    full_frame = build_feature_frame(bars, horizon_minutes, vpin_timeframes=vpin_timeframes, progress=progress)
+    full_frame = build_feature_frame(bars, horizon_minutes, timeframes=timeframes, progress=progress)
     if progress is not None:
         progress.step("Filtering analysis window")
     analysis_frame = filter_chart_data(full_frame, date=date, start=start, end=end)
@@ -1653,9 +1653,9 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated forward target horizons. Supports m/h/d labels. Default: 5m,15m,30m,1h,1d,7d,14d,28d,60d,365d.",
     )
     parser.add_argument(
-        "--vpin-timeframes",
-        default=",".join(DEFAULT_VPIN_TIMEFRAMES),
-        help="Comma-separated VPIN indicator timeframes. Default: 1m,5m,15m,30m,1h,4h,1d.",
+        "--timeframes",
+        default=",".join(DEFAULT_TIMEFRAMES),
+        help="Comma-separated indicator timeframes. Default: 1m,5m,15m,30m,1h,4h,1d.",
     )
     parser.add_argument(
         "--quantiles",
@@ -1707,7 +1707,7 @@ def main() -> int:
     progress = ProgressReporter(enabled=not args.no_progress)
     try:
         horizon_minutes = parse_horizons(args.horizons)
-        vpin_timeframes = parse_vpin_timeframes(args.vpin_timeframes)
+        timeframes = parse_timeframes(args.timeframes)
         progress.step(f"Loading {args.instrument} data from {data_path}")
         df = load_data(data_path, instrument=args.instrument)
         progress.step("Preparing bars")
@@ -1721,7 +1721,7 @@ def main() -> int:
             end=args.end,
             quantiles=args.quantiles,
             feature_set=args.feature_set,
-            vpin_timeframes=vpin_timeframes,
+            timeframes=timeframes,
             progress=progress,
         )
         progress.step(f"Writing CSVs to {args.csv_dir}")
@@ -1756,7 +1756,7 @@ def main() -> int:
         f"to {analysis_frame.index.max()}"
     )
     print(f"Feature set: {args.feature_set}")
-    print(f"VPIN timeframes: {', '.join(timeframe.label for timeframe in vpin_timeframes)}")
+    print(f"Timeframes: {', '.join(timeframe.label for timeframe in timeframes)}")
     print(f"Features tested: {len(select_feature_columns(analysis_frame, feature_set=args.feature_set)):,}")
     print(f"Targets tested: {len(select_target_columns(analysis_frame)):,}")
     print(f"Ranked feature-target pairs: {len(top_features):,}")

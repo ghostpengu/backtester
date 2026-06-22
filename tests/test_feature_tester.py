@@ -25,7 +25,7 @@ from feature_tester import (
     compute_technical_features,
     make_quantile_buckets,
     parse_horizons,
-    parse_vpin_timeframes,
+    parse_timeframes,
     run_feature_analysis,
     select_feature_columns,
     write_csv_outputs,
@@ -177,7 +177,7 @@ class FeatureTesterTests(unittest.TestCase):
 
         indicators = compute_indicator_features(
             bars,
-            vpin_timeframes=parse_vpin_timeframes("1m,5m,15m"),
+            timeframes=parse_timeframes("1m,5m,15m"),
         )
 
         self.assertEqual(list(indicators.index), list(bars.index))
@@ -260,7 +260,7 @@ class FeatureTesterTests(unittest.TestCase):
             horizon_minutes=[5],
             date="all",
             quantiles=3,
-            vpin_timeframes=parse_vpin_timeframes("1m"),
+            timeframes=parse_timeframes("1m"),
         )
         pairs = collect_top_pairs(top_features)
         bundle = build_explorer_series_bundle(
@@ -302,7 +302,7 @@ class FeatureTesterTests(unittest.TestCase):
             horizon_minutes=[5],
             date="all",
             quantiles=3,
-            vpin_timeframes=parse_vpin_timeframes("1m,5m"),
+            timeframes=parse_timeframes("1m,5m"),
         )
 
         with tempfile.TemporaryDirectory() as directory:
