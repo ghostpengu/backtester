@@ -9,6 +9,7 @@ import pandas as pd
 
 from feature_tester import (
     HorizonSpec,
+    VWAPFeatureConfig,
     build_explorer_series_bundle,
     build_top_features,
     collect_top_pairs,
@@ -185,6 +186,34 @@ class FeatureTesterTests(unittest.TestCase):
         self.assertIn("vpin_5m", indicators.columns)
         self.assertIn("vpin_spread_raw_15m", indicators.columns)
         self.assertIn("spread_cross_top_5m", indicators.columns)
+
+    def test_indicator_features_apply_vwap_lookback_config(self) -> None:
+        day_one = pd.date_range("2026-01-01 09:30", periods=2, freq="min")
+        day_two = pd.date_range("2026-01-02 09:30", periods=2, freq="min")
+        index = day_one.union(day_two)
+        bars = pd.DataFrame(
+            {
+                "open": [100.0, 110.0, 200.0, 220.0],
+                "high": [100.0, 110.0, 200.0, 220.0],
+                "low": [100.0, 110.0, 200.0, 220.0],
+                "close": [100.0, 110.0, 200.0, 220.0],
+                "volume": [100.0, 100.0, 100.0, 100.0],
+            },
+            index=index,
+        )
+
+        session_vwap = compute_indicator_features(
+            bars,
+            timeframes=parse_timeframes("1m"),
+        )
+        rolling_vwap = compute_indicator_features(
+            bars,
+            timeframes=parse_timeframes("1m"),
+            vwap_config=VWAPFeatureConfig(lookback="1w"),
+        )
+
+        self.assertAlmostEqual(session_vwap["vwap_1m"].iloc[2], 200.0)
+        self.assertAlmostEqual(rolling_vwap["vwap_1m"].iloc[2], (100.0 + 110.0 + 200.0) / 3.0)
 
     def test_parse_feature_timeframe_label_extracts_indicator_windows(self) -> None:
         self.assertEqual(parse_feature_timeframe_label("spread_below_bottom_4h"), "4h")

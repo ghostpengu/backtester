@@ -13,7 +13,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from indicators import compute_vpin_lsf, compute_vpin_spread
+from indicators import VWAPBandsConfig, compute_vpin_lsf, compute_vpin_spread, compute_vwap_bands
 from backtester import (
     DEFAULT_INSTRUMENT,
     default_data_path,
@@ -38,6 +38,7 @@ DEFAULT_FEATURE_SET = "vpin"
 DEFAULT_QUANTILES = 5
 DEFAULT_TOP_N = 20
 DEFAULT_SAMPLE_ROWS = 0
+DEFAULT_VWAP_LOOKBACK = "none"
 EXPLORER_MAX_ROWS = 5_000
 TABLE_TEXT_LEFT_COLUMNS = frozenset({"rank", "feature", "target", "target_family"})
 REGULAR_SESSION_START = "09:30"
@@ -75,6 +76,26 @@ VPIN_INTERNAL_FEATURES = {
     "v_sell",
     "z_score",
 }
+VWAP_SIGNAL_FEATURES = {
+    "vwap",
+    "vwap_std",
+    "vwap_zscore",
+    "vwap_distance_pct",
+    "vwap_signal",
+    "vwap_signal_strength",
+    "vwap_upper_2sigma",
+    "vwap_lower_2sigma",
+    "vwap_upper_3sigma",
+    "vwap_lower_3sigma",
+    "vwap_above_upper_2sigma",
+    "vwap_below_lower_2sigma",
+    "vwap_cross_upper_2sigma",
+    "vwap_cross_lower_2sigma",
+    "vwap_above_upper_3sigma",
+    "vwap_below_lower_3sigma",
+    "vwap_cross_upper_3sigma",
+    "vwap_cross_lower_3sigma",
+}
 
 
 @dataclass(frozen=True)
@@ -88,6 +109,11 @@ class HorizonSpec:
 class TimeframeSpec:
     label: str
     minutes: int
+
+
+@dataclass(frozen=True)
+class VWAPFeatureConfig:
+    lookback: str = DEFAULT_VWAP_LOOKBACK
 
 
 class ProgressReporter:
@@ -278,6 +304,7 @@ def build_feature_frame(
     *,
     feature_windows: tuple[int, ...] = DEFAULT_FEATURE_WINDOWS,
     timeframes: list[TimeframeSpec] | None = None,
+    vwap_config: VWAPFeatureConfig | None = None,
     progress: ProgressReporter | None = None,
 ) -> pd.DataFrame:
     _validate_ohlcv_bars(bars)
@@ -290,8 +317,13 @@ def build_feature_frame(
     technical = compute_technical_features(bars, feature_windows)
 
     if progress is not None:
-        progress.step("Computing VPIN indicator features")
-    indicators = compute_indicator_features(bars, timeframes=timeframes, progress=progress)
+        progress.step("Computing indicator features")
+    indicators = compute_indicator_features(
+        bars,
+        timeframes=timeframes,
+        vwap_config=vwap_config,
+        progress=progress,
+    )
 
     if progress is not None:
         progress.step("Computing forward targets")
@@ -373,6 +405,7 @@ def compute_indicator_features(
     bars: pd.DataFrame,
     *,
     timeframes: list[TimeframeSpec] | None = None,
+    vwap_config: VWAPFeatureConfig | None = None,
     progress: ProgressReporter | None = None,
 ) -> pd.DataFrame:
     _validate_ohlcv_bars(bars)
@@ -386,7 +419,7 @@ def compute_indicator_features(
         if timeframe_bars.empty:
             continue
 
-        indicators = compute_single_timeframe_vpin(timeframe_bars)
+        indicators = compute_single_timeframe_vpin(timeframe_bars, vwap_config=vwap_config)
         indicators = suffix_timeframe_columns(indicators, timeframe.label)
         aligned = align_timeframe_features(indicators, bars.index)
         frames.append(aligned)
@@ -396,10 +429,16 @@ def compute_indicator_features(
     return pd.concat(frames, axis=1).replace([np.inf, -np.inf], np.nan)
 
 
-def compute_single_timeframe_vpin(bars: pd.DataFrame) -> pd.DataFrame:
+def compute_single_timeframe_vpin(
+    bars: pd.DataFrame,
+    *,
+    vwap_config: VWAPFeatureConfig | None = None,
+) -> pd.DataFrame:
+    vwap_config = vwap_config or VWAPFeatureConfig()
     spread = compute_vpin_spread(bars)
     lsf = compute_vpin_lsf(bars)
-    indicators = spread.join(lsf, rsuffix="_lsf")
+    vwap = compute_vwap_bands(bars, VWAPBandsConfig(lookback=vwap_config.lookback))
+    indicators = spread.join(lsf, rsuffix="_lsf").join(vwap)
     for column in indicators.select_dtypes(include=["bool"]).columns:
         indicators[column] = indicators[column].astype(int)
     return indicators.select_dtypes(include=[np.number]).replace([np.inf, -np.inf], np.nan)
@@ -532,9 +571,11 @@ def select_feature_columns(frame: pd.DataFrame, feature_set: str = DEFAULT_FEATU
         return base_columns
     if normalized == "vpin":
         return [column for column in base_columns if is_vpin_feature(column)]
+    if normalized == "vwap":
+        return [column for column in base_columns if is_vwap_feature(column)]
     if normalized == "ohlcv":
-        return [column for column in base_columns if not is_vpin_related_feature(column)]
-    raise ValueError("feature_set must be one of: vpin, all, ohlcv.")
+        return [column for column in base_columns if not is_indicator_related_feature(column)]
+    raise ValueError("feature_set must be one of: vpin, vwap, all, ohlcv.")
 
 
 def is_vpin_feature(column: str) -> bool:
@@ -544,6 +585,18 @@ def is_vpin_feature(column: str) -> bool:
 def is_vpin_related_feature(column: str) -> bool:
     base_name = base_vpin_feature_name(column)
     return is_vpin_feature(column) or base_name in VPIN_INTERNAL_FEATURES or "vpin" in column
+
+
+def is_vwap_feature(column: str) -> bool:
+    return base_vpin_feature_name(column) in VWAP_SIGNAL_FEATURES
+
+
+def is_vwap_related_feature(column: str) -> bool:
+    return is_vwap_feature(column) or "vwap" in column
+
+
+def is_indicator_related_feature(column: str) -> bool:
+    return is_vpin_related_feature(column) or is_vwap_related_feature(column)
 
 
 def base_vpin_feature_name(column: str) -> str:
@@ -1327,8 +1380,10 @@ def write_html_report(
     top_features: pd.DataFrame,
     instrument: str = DEFAULT_INSTRUMENT,
     top_n: int = DEFAULT_TOP_N,
+    vwap_config: VWAPFeatureConfig | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    vwap_config = vwap_config or VWAPFeatureConfig()
 
     figures = [
         build_correlation_heatmap(correlations, top_n),
@@ -1383,6 +1438,7 @@ def write_html_report(
             "<p class='meta'>"
             f"Rows: {len(frame):,} | "
             f"Range: {frame.index.min()} to {frame.index.max()} | "
+            f"VWAP anchor/lookback: {html.escape(vwap_config.lookback)} | "
             f"Ranked pairs: {len(top_features):,}"
             "</p>"
         ),
@@ -1569,9 +1625,16 @@ def run_feature_analysis(
     quantiles: int = DEFAULT_QUANTILES,
     feature_set: str = DEFAULT_FEATURE_SET,
     timeframes: list[TimeframeSpec] | None = None,
+    vwap_config: VWAPFeatureConfig | None = None,
     progress: ProgressReporter | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    full_frame = build_feature_frame(bars, horizon_minutes, timeframes=timeframes, progress=progress)
+    full_frame = build_feature_frame(
+        bars,
+        horizon_minutes,
+        timeframes=timeframes,
+        vwap_config=vwap_config,
+        progress=progress,
+    )
     if progress is not None:
         progress.step("Filtering analysis window")
     analysis_frame = filter_chart_data(full_frame, date=date, start=start, end=end)
@@ -1658,6 +1721,15 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated indicator timeframes. Default: 1m,5m,15m,30m,1h,4h,1d.",
     )
     parser.add_argument(
+        "--vwap-lookback",
+        choices=["none", "1w", "1y"],
+        default=DEFAULT_VWAP_LOOKBACK,
+        help=(
+            "VWAP anchor/lookback for VWAP feature columns: session-reset none, rolling one week, "
+            "or rolling one year. Default: none."
+        ),
+    )
+    parser.add_argument(
         "--quantiles",
         type=int,
         default=DEFAULT_QUANTILES,
@@ -1665,11 +1737,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--feature-set",
-        choices=["vpin", "all", "ohlcv"],
+        choices=["vpin", "vwap", "all", "ohlcv"],
         default=DEFAULT_FEATURE_SET,
         help=(
             "Features to test: vpin for VPIN indicator/signal columns, "
-            "all for every feature including VPIN internals, ohlcv for non-VPIN features. Default: vpin."
+            "vwap for VWAP band features, all for every feature including indicator internals, "
+            "ohlcv for non-indicator features. Default: vpin."
         ),
     )
     parser.add_argument(
@@ -1708,6 +1781,7 @@ def main() -> int:
     try:
         horizon_minutes = parse_horizons(args.horizons)
         timeframes = parse_timeframes(args.timeframes)
+        vwap_config = VWAPFeatureConfig(lookback=args.vwap_lookback)
         progress.step(f"Loading {args.instrument} data from {data_path}")
         df = load_data(data_path, instrument=args.instrument)
         progress.step("Preparing bars")
@@ -1722,6 +1796,7 @@ def main() -> int:
             quantiles=args.quantiles,
             feature_set=args.feature_set,
             timeframes=timeframes,
+            vwap_config=vwap_config,
             progress=progress,
         )
         progress.step(f"Writing CSVs to {args.csv_dir}")
@@ -1742,6 +1817,7 @@ def main() -> int:
             top_features=top_features,
             instrument=args.instrument,
             top_n=args.top_n,
+            vwap_config=vwap_config,
         )
         progress.step("Done")
         opened = False if args.no_open else open_chart(output_path)
@@ -1757,6 +1833,7 @@ def main() -> int:
     )
     print(f"Feature set: {args.feature_set}")
     print(f"Timeframes: {', '.join(timeframe.label for timeframe in timeframes)}")
+    print(f"VWAP anchor/lookback: {args.vwap_lookback}")
     print(f"Features tested: {len(select_feature_columns(analysis_frame, feature_set=args.feature_set)):,}")
     print(f"Targets tested: {len(select_target_columns(analysis_frame)):,}")
     print(f"Ranked feature-target pairs: {len(top_features):,}")
